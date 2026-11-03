@@ -69,6 +69,12 @@ relaunching** (`Stop-Process -Name brighttray`). Otherwise the link fails on a l
 `brighttray.exe`, or — if it succeeds — the new launch exits silently and you end up
 testing the old build.
 
+**Leave the tray running by launching it through Explorer**
+(`explorer.exe <path>\brighttray.exe`), not with `Start-Process` from an agent shell.
+A process started from the shell belongs to the Claude Code session's process tree
+and is killed when that session restarts, which looks exactly like a crash. A
+copy started from the shell is fine for a test that ends with the session.
+
 ### Verifying a change
 
 There is no test suite. Verification is running against the attached monitor.
@@ -116,6 +122,20 @@ commands, deliberately **not** checkmarks, and go through `Engine::Force` rather
 `Set`. The panel can change behind the app's back — after deep sleep it may wake at
 100% — so a checkmark derived from the cached value would lie. A plain `Set` would
 also be skipped as a no-op whenever the stale cache happened to match the preset.
+
+**The M27Q resets itself to 100 whenever the display wakes**, even after a 4 s
+display-off. Measured by polling `bright.exe` after a wake: it answers DDC/CI at
+once, reports a transitional value (50) for about 1 s, then jumps to 100 at about
+1.4 s. So the tray registers for `GUID_CONSOLE_DISPLAY_STATE`, and on an off → on
+transition it calls `Engine::Resync` at 2 s and again at 10 s. The worker then reads
+every panel back and adopts what it finds. A channel with a pending or unverified
+write is skipped, because user input wins. `Resync` deliberately does not set
+`wake_`: that flag means "input arrived", and setting it would cut a quiet window
+short and skip its verified write.
+
+To test this, turn the displays off with `PostMessage(HWND_BROADCAST, WM_SYSCOMMAND,
+SC_MONITORPOWER, 2)`, wake them with a one-pixel `mouse_event` move, and run the
+tray with `BRIGHTTRAY_LOG=1`. The log shows `display state` and `resync` lines.
 
 ## Architecture
 
@@ -315,9 +335,9 @@ in the monitor OSD menu** — it is per-monitor and some firmware ships with it 
   The harness is tied to this machine and is not side-effect free: the taskbar click
   is at a fixed `(300, 1420)`, which assumes a 1440 px tall primary display; and it
   force-kills any running `brighttray` **and every `notepad` process** before
-  starting. It also takes over the real mouse while it runs. It opens the flyout by posting `WM_TRAY`
-  (`0x8001`) with `NIN_SELECT`. That is fine for *opening*; only the dismissal must be
-  a real click. Run it with `powershell -File tray-cpp\test-dismiss.ps1` and read the
+  starting. It also takes over the real mouse while it runs. It opens the flyout by
+  posting `WM_TRAY` (`0x8001`) with `NIN_SELECT`. That is fine for *opening*; only
+  the dismissal must be a real click. Run it with `powershell -File tray-cpp\test-dismiss.ps1` and read the
   table it prints: every case should show `DismissedAfterOutsideClick = True`.
 
 ## The vendor install

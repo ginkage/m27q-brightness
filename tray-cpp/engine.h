@@ -104,6 +104,20 @@ public:
         if (on_target_changed_) on_target_changed_(i, clamped);
     }
 
+    // Asks the worker to read every panel back and adopt what it finds. The panel
+    // can change behind the app's back - it may wake from deep sleep at 100% - and
+    // without this the cached value goes on being shown as if it were the truth.
+    //
+    // Deliberately does not set wake_, which means "input arrived": that would cut a
+    // quiet window short and skip its verification. Only the idle wait listens.
+    void Resync() {
+        {
+            std::lock_guard<std::mutex> lock(gate_);
+            resync_ = true;
+        }
+        cv_.notify_one();
+    }
+
     // Invoked on the worker thread. The UI implementation posts a message.
     void set_on_confirmed(Callback cb) { on_confirmed_ = std::move(cb); }
 
@@ -143,6 +157,14 @@ private:
 
     void Run() {
         while (!stop_) {
+            bool resync;
+            {
+                std::lock_guard<std::mutex> lock(gate_);
+                resync = resync_;
+                resync_ = false;
+            }
+            if (resync) ReadBack();
+
             bool wrote = false;
 
             // Drain: keep firing the newest value for whichever display is dirty.
@@ -183,7 +205,7 @@ private:
             }
 
             std::unique_lock<std::mutex> lock(gate_);
-            cv_.wait(lock, [this] { return wake_ || stop_.load(); });
+            cv_.wait(lock, [this] { return wake_ || resync_ || stop_.load(); });
             wake_ = false;
         }
     }
@@ -201,11 +223,37 @@ private:
         }
     }
 
+    // User input wins over a read-back: a channel with a pending or unverified
+    // write is left alone, since the write is about to put the user's value there.
+    void ReadBack() {
+        for (size_t i = 0; i < channels_.size() && !stop_; ++i) {
+            Channel& ch = channels_[i];
+            if (ch.last_sent != ch.confirmed) continue;
+            {
+                std::lock_guard<std::mutex> lock(gate_);
+                if (ch.dirty) continue;
+            }
+
+            DWORD current = 0;
+            if (!set_.displays()[ch.index].TryRead(&current, nullptr)) continue;
+
+            {
+                std::lock_guard<std::mutex> lock(gate_);
+                if (ch.dirty) continue;  // input arrived during the read
+                ch.desired = current;
+            }
+            ch.last_sent = current;
+            ch.confirmed = current;
+            if (on_confirmed_) on_confirmed_(static_cast<int>(i), current);
+        }
+    }
+
     ddc::DisplaySet set_;
     std::vector<Channel> channels_;
     mutable std::mutex gate_;
     std::condition_variable cv_;
     bool wake_ = false;
+    bool resync_ = false;  // guarded by gate_
     std::atomic<bool> stop_{false};
     std::thread worker_;
     Callback on_confirmed_;

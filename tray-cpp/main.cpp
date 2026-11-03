@@ -58,6 +58,15 @@ constexpr int HOTKEY_UP   = 1;
 constexpr int HOTKEY_DOWN = 2;
 constexpr int kStep = 5;
 
+// After the display comes back on, the panel is read back twice. Measured on the
+// M27Q after a 4 s display-off: it answers DDC/CI at once but reports a transitional
+// value for ~1 s, then jumps to 100 at ~1.4 s and stays there. The early read lands
+// after that jump; the late one covers a longer sleep that wakes more slowly.
+constexpr UINT_PTR kResyncSoon = 1;
+constexpr UINT_PTR kResyncLate = 2;
+constexpr UINT kResyncSoonMs = 2000;
+constexpr UINT kResyncLateMs = 10000;
+
 // Flyout metrics at 96 dpi. ScaleMetrics derives the
 // g* values actually used for layout, so the panel follows the monitor it opens on.
 constexpr int kWidth  = 320;
@@ -107,6 +116,8 @@ ULONGLONG g_last_select = 0;
 HHOOK g_mouse_hook = nullptr;
 UINT g_hotkey_mods = kModsCtrlAlt;
 int g_drag_row = -1;
+HPOWERNOTIFY g_display_notify = nullptr;
+bool g_display_was_off = false;
 
 void Log(const wchar_t* format, ...) {
     static int enabled = -1;
@@ -716,6 +727,34 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
         Reload();
         return 0;
 
+    // Registration delivers the current state at once, so only an off -> on
+    // transition counts; dimming is not the panel sleeping.
+    case WM_POWERBROADCAST:
+        if (wparam == PBT_POWERSETTINGCHANGE) {
+            auto* setting = reinterpret_cast<const POWERBROADCAST_SETTING*>(lparam);
+            if (setting->PowerSetting == GUID_CONSOLE_DISPLAY_STATE &&
+                setting->DataLength >= sizeof(DWORD)) {
+                DWORD state = *reinterpret_cast<const DWORD*>(setting->Data);
+                Log(L"display state %lu", state);
+                if (state == 0) {
+                    g_display_was_off = true;
+                } else if (state == 1 && g_display_was_off) {
+                    g_display_was_off = false;
+                    SetTimer(hwnd, kResyncSoon, kResyncSoonMs, nullptr);
+                    SetTimer(hwnd, kResyncLate, kResyncLateMs, nullptr);
+                }
+            }
+        }
+        return TRUE;
+
+    case WM_TIMER:
+        if (wparam == kResyncSoon || wparam == kResyncLate) {
+            KillTimer(hwnd, wparam);
+            Log(L"resync (timer %llu)", static_cast<unsigned long long>(wparam));
+            if (g_engine) g_engine->Resync();
+        }
+        return 0;
+
     case WM_SETTINGCHANGE:
         if (g_flyout) ApplyFlyoutChrome(g_flyout);
         UpdateIcon();
@@ -764,6 +803,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
                              0, 0, 0, 0, nullptr, nullptr, instance, nullptr);
 
     CreateTray(g_main);
+    g_display_notify = RegisterPowerSettingNotification(g_main, &GUID_CONSOLE_DISPLAY_STATE,
+                                                        DEVICE_NOTIFY_WINDOW_HANDLE);
     g_hotkey_mods = LoadHotkeyMods();
     ApplyHotkeys();
     Reload();
@@ -774,6 +815,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, LPWSTR, int) {
         DispatchMessageW(&msg);
     }
 
+    if (g_display_notify) UnregisterPowerSettingNotification(g_display_notify);
     UnregisterHotKey(g_main, HOTKEY_UP);
     UnregisterHotKey(g_main, HOTKEY_DOWN);
     Shell_NotifyIconW(NIM_DELETE, &g_nid);
