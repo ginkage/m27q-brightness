@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "engine.h"
 #include "icon.h"
@@ -58,14 +59,15 @@ constexpr int HOTKEY_UP   = 1;
 constexpr int HOTKEY_DOWN = 2;
 constexpr int kStep = 5;
 
-// After the display comes back on, the panel is read back twice. Measured on the
-// M27Q after a 4 s display-off: it answers DDC/CI at once but reports a transitional
-// value for ~1 s, then jumps to 100 at ~1.4 s and stays there. The early read lands
-// after that jump; the late one covers a longer sleep that wakes more slowly.
-constexpr UINT_PTR kResyncSoon = 1;
-constexpr UINT_PTR kResyncLate = 2;
-constexpr UINT kResyncSoonMs = 2000;
-constexpr UINT kResyncLateMs = 10000;
+// The M27Q resets itself to 100 whenever the display wakes, so the brightness from
+// before it went off is written back twice. Measured after a 4 s display-off: the
+// panel answers DDC/CI at once but reports a transitional value for ~1 s, then jumps
+// to 100 at ~1.4 s and stays there. The early restore lands after that jump; the late
+// one covers a longer sleep whose reset comes later.
+constexpr UINT_PTR kRestoreSoon = 1;
+constexpr UINT_PTR kRestoreLate = 2;
+constexpr UINT kRestoreSoonMs = 2000;
+constexpr UINT kRestoreLateMs = 10000;
 
 // Flyout metrics at 96 dpi. ScaleMetrics derives the
 // g* values actually used for layout, so the panel follows the monitor it opens on.
@@ -118,6 +120,16 @@ UINT g_hotkey_mods = kModsCtrlAlt;
 int g_drag_row = -1;
 HPOWERNOTIFY g_display_notify = nullptr;
 bool g_display_was_off = false;
+
+// Each display's brightness as the display turned off, to be put back once it wakes.
+// Taken at switch-off rather than from the cache on wake, because a deep sleep can
+// drop the link and the WM_DISPLAYCHANGE reload then reads the panel's reset value.
+struct Saved {
+    std::wstring name;
+    DWORD value;
+};
+std::vector<Saved> g_saved;
+bool g_restoring = false;
 
 void Log(const wchar_t* format, ...) {
     static int enabled = -1;
@@ -653,7 +665,11 @@ void Reload() {
     g_engine->set_on_confirmed([](int index, DWORD value) {
         PostMessageW(g_main, WM_CONFIRMED, static_cast<WPARAM>(index), static_cast<LPARAM>(value));
     });
+    // Runs synchronously on this thread for every change, so it is also where user
+    // input is seen: anything the user sets after a wake is theirs to keep, and the
+    // pending restore is dropped rather than allowed to overwrite it.
     g_engine->set_on_target_changed([](int, DWORD) {
+        if (!g_restoring) g_saved.clear();
         PostMessageW(g_main, WM_CONFIRMED, static_cast<WPARAM>(-1), 0);
     });
 
@@ -662,6 +678,29 @@ void Reload() {
                                g_main, nullptr, g_instance, nullptr);
     if (g_flyout) ApplyFlyoutChrome(g_flyout);
     UpdateIcon();
+}
+
+void SaveForWake() {
+    KillTimer(g_main, kRestoreSoon);  // a restore must never land while the display is off
+    KillTimer(g_main, kRestoreLate);
+    g_saved.clear();
+    if (!g_engine) return;
+    for (int i = 0; i < g_engine->count(); ++i)
+        g_saved.push_back({g_engine->NameOf(i), g_engine->ValueOf(i)});
+}
+
+// Forced, so it reaches the panel even though the cache already holds the value.
+// Skipped per display if the set changed while it slept and no longer lines up.
+void RestoreAfterWake(bool last) {
+    Log(L"restore (%s), %zu saved", last ? L"late" : L"soon", g_saved.size());
+    if (g_engine && g_engine->count() == static_cast<int>(g_saved.size())) {
+        g_restoring = true;
+        for (int i = 0; i < g_engine->count(); ++i)
+            if (g_engine->NameOf(i) == g_saved[i].name)
+                g_engine->Force(i, g_saved[i].value);
+        g_restoring = false;
+    }
+    if (last) g_saved.clear();
 }
 
 LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -738,20 +777,20 @@ LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
                 Log(L"display state %lu", state);
                 if (state == 0) {
                     g_display_was_off = true;
+                    SaveForWake();
                 } else if (state == 1 && g_display_was_off) {
                     g_display_was_off = false;
-                    SetTimer(hwnd, kResyncSoon, kResyncSoonMs, nullptr);
-                    SetTimer(hwnd, kResyncLate, kResyncLateMs, nullptr);
+                    SetTimer(hwnd, kRestoreSoon, kRestoreSoonMs, nullptr);
+                    SetTimer(hwnd, kRestoreLate, kRestoreLateMs, nullptr);
                 }
             }
         }
         return TRUE;
 
     case WM_TIMER:
-        if (wparam == kResyncSoon || wparam == kResyncLate) {
+        if (wparam == kRestoreSoon || wparam == kRestoreLate) {
             KillTimer(hwnd, wparam);
-            Log(L"resync (timer %llu)", static_cast<unsigned long long>(wparam));
-            if (g_engine) g_engine->Resync();
+            RestoreAfterWake(wparam == kRestoreLate);
         }
         return 0;
 

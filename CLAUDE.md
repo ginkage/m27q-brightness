@@ -119,23 +119,35 @@ the value name `BrightTray`.
 The tray menu also carries fixed **50% / 100%** presets, applied as a percentage of
 each display's own reported maximum rather than as a raw value. They are plain
 commands, deliberately **not** checkmarks, and go through `Engine::Force` rather than
-`Set`. The panel can change behind the app's back — after deep sleep it may wake at
-100% — so a checkmark derived from the cached value would lie. A plain `Set` would
+`Set`. The panel can change behind the app's back — it wakes at 100%, see below —
+so a checkmark derived from the cached value would lie. A plain `Set` would
 also be skipped as a no-op whenever the stale cache happened to match the preset.
 
 **The M27Q resets itself to 100 whenever the display wakes**, even after a 4 s
 display-off. Measured by polling `bright.exe` after a wake: it answers DDC/CI at
 once, reports a transitional value (50) for about 1 s, then jumps to 100 at about
-1.4 s. So the tray registers for `GUID_CONSOLE_DISPLAY_STATE`, and on an off → on
-transition it calls `Engine::Resync` at 2 s and again at 10 s. The worker then reads
-every panel back and adopts what it finds. A channel with a pending or unverified
-write is skipped, because user input wins. `Resync` deliberately does not set
-`wake_`: that flag means "input arrived", and setting it would cut a quiet window
-short and skip its verified write.
+1.4 s. So the tray registers for `GUID_CONSOLE_DISPLAY_STATE` and puts the old
+brightness back:
 
-To test this, turn the displays off with `PostMessage(HWND_BROADCAST, WM_SYSCOMMAND,
-SC_MONITORPOWER, 2)`, wake them with a one-pixel `mouse_event` move, and run the
-tray with `BRIGHTTRAY_LOG=1`. The log shows `display state` and `resync` lines.
+- **At display-off**, `SaveForWake` records each display's value by name. It is
+  taken then, not read from the cache on wake. A deep sleep can drop the link, and
+  the `WM_DISPLAYCHANGE` reload would then fill the cache with the panel's reset
+  value.
+- **After an off → on transition**, `RestoreAfterWake` forces the saved values back
+  at 2 s, just after the measured jump, and again at 10 s for a longer sleep whose
+  reset comes later.
+- **User input after a wake cancels the restore.** The `on_target_changed` callback
+  runs synchronously for every `Set`, `Nudge` and `Force`, so it clears the saved
+  values. The restore's own `Force` is exempt via `g_restoring`.
+- **Switching off sends a quick off → on → off flicker**, so every "off" also kills
+  any pending restore timers.
+
+To test this, run the tray with `BRIGHTTRAY_LOG=1`. Turn the displays off with
+`PostMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)` and wake them with a
+one-pixel `mouse_event` move. Then poll `bright.exe` every 0.5 s: the value should go
+100 at about 1.4 s, then back to the saved value by about 2.1 s. The log shows
+`display state` and `restore` lines. To test the cancellation, post `WM_HOTKEY` 5 s
+after waking; the nudged value must survive the 10 s pass, which logs `0 saved`.
 
 ## Architecture
 
